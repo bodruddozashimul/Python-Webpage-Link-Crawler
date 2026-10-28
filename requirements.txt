@@ -1,0 +1,6 @@
+requests>=2.31,<3
+urllib3>=1.26
+beautifulsoup4>=4.12
+# Optional but recommended: a faster, more forgiving HTML parser.
+# The crawler falls back to Python's built-in parser if lxml is missing.
+lxml>=4.9
