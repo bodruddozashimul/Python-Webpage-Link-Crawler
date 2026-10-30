@@ -6,14 +6,14 @@ Link Crawler - crawl a website recursively and collect every link with its title
     python crawler.py https://example.com --max-depth 2 --output links.csv
     python crawler.py example.com --max-pages 0 --workers 8 --delay 0.2
 
-Run ``python crawler.py --help`` to see every option.
+Run ``python crawler.py --help`` to see every option, or ``python gui.py``
+for the desktop app.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import importlib.util
 import json
 import logging
 import posixpath
@@ -37,8 +37,11 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# lxml is faster and copes better with broken HTML, but it is optional.
-HTML_PARSER = "lxml" if importlib.util.find_spec("lxml") else "html.parser"
+try:  # lxml is faster and copes better with broken HTML, but it is optional.
+    import lxml.etree as _lxml_etree
+except ImportError:  # pragma: no cover - depends on what is installed
+    _lxml_etree = None
+HTML_PARSER = "lxml" if _lxml_etree is not None else "html.parser"
 
 try:  # Hide BeautifulSoup's harmless "this looks like XML / a URL" warnings.
     from bs4 import MarkupResemblesLocatorWarning, XMLParsedAsHTMLWarning
@@ -48,13 +51,14 @@ try:  # Hide BeautifulSoup's harmless "this looks like XML / a URL" warnings.
 except ImportError:  # pragma: no cover - older BeautifulSoup versions
     pass
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger("crawler")
 
 ROBOTS_AGENT = "LinkCrawler"  # name matched against "User-agent:" lines in robots.txt
 DEFAULT_USER_AGENT = f"Mozilla/5.0 (compatible; {ROBOTS_AGENT}/{__version__})"
 ROBOTS_BLOCKED = "blocked by robots.txt"
+CANCELLED = "cancelled"
 MAX_PAGE_BYTES = 5 * 1024 * 1024  # never download more than 5 MB of a single page
 HTML_CONTENT_TYPES = {"", "text/html", "application/xhtml+xml"}
 
@@ -87,6 +91,13 @@ class LinkRecord:
     redirected_to: str = ""    # final URL, when the request was redirected
     content_type: str = ""     # e.g. text/html, application/pdf
     error: str = ""            # network error, "blocked by robots.txt", ...
+
+    @property
+    def broken(self) -> bool:
+        """True if the link returned an HTTP error (4xx/5xx) or could not be reached."""
+        if (self.status or 0) >= 400:
+            return True
+        return bool(self.error) and self.error not in (ROBOTS_BLOCKED, CANCELLED)
 
 
 @dataclass
@@ -148,7 +159,7 @@ def has_skipped_extension(url: str) -> bool:
 def describe_error(exc: Exception) -> str:
     """Turn a requests exception into a short, readable message."""
     if isinstance(exc, requests.exceptions.SSLError):
-        kind = "SSL error (try --insecure for self-signed certificates)"
+        kind = "SSL error (self-signed certificate? use --insecure / 'Skip SSL certificate check')"
     elif isinstance(exc, requests.exceptions.Timeout):
         kind = "timeout"
     elif isinstance(exc, requests.exceptions.ConnectionError):
@@ -400,22 +411,37 @@ class Crawler:
 
     # ---- public API ------------------------------------------------------ #
     def run(self) -> list[LinkRecord]:
-        """Crawl the site and return every unique link found, in discovery order."""
+        """Crawl the site and return every unique link found, in discovery order.
+
+        A running crawl can be ended early with stop() (from another thread) or
+        Ctrl+C; the links collected up to that point are still returned.
+        """
         self.started_at = utc_now()
         pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="crawler")
         try:
             self._check_robots()
-            self._crawl(pool)
-            if self.external_titles:
+            if not self._stop.is_set():
+                self._crawl(pool)
+            if self.external_titles and not self._stop.is_set():
                 self._fetch_external_titles(pool)
         except KeyboardInterrupt:
-            self.interrupted = True
             self._stop.set()
-            log.warning("Interrupted - stopping and saving what was collected so far...")
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
             self.finished_at = utc_now()
+        if self._stop.is_set():
+            self.interrupted = True
+            log.warning("Stopped - keeping the %d links collected so far.", len(self.records))
         return list(self.records.values())
+
+    def stop(self) -> None:
+        """Ask a running crawl to stop as soon as possible. Safe to call from any thread."""
+        self._stop.set()
+
+    @property
+    def links_found(self) -> int:
+        """Number of unique links collected so far (handy for progress displays)."""
+        return len(self.records)
 
     def is_internal(self, url: str) -> bool:
         """Does *url* belong to the website being crawled?"""
@@ -434,10 +460,7 @@ class Crawler:
             "total_links": len(records),
             "internal_links": sum(1 for r in records if r.internal),
             "external_links": sum(1 for r in records if not r.internal),
-            "broken_links": sum(
-                1 for r in records
-                if (r.status or 0) >= 400 or (r.error and r.error != ROBOTS_BLOCKED)
-            ),
+            "broken_links": sum(1 for r in records if r.broken),
             "interrupted": self.interrupted,
             "crawler_version": __version__,
         }
@@ -452,8 +475,8 @@ class Crawler:
             log.info("robots.txt asks for %.1fs between requests - using that.", delay)
             self.limiter.delay = delay
         if not self.robots.allowed(self.start_url, session):
-            log.warning("robots.txt does not allow crawling %s (use --ignore-robots only if "
-                        "you own the site or have permission).", self.start_url)
+            log.warning("robots.txt does not allow crawling %s. Turn off robots.txt checking only "
+                        "if you own the site or have permission.", self.start_url)
 
     def _crawl(self, pool: ThreadPoolExecutor) -> None:
         start = self.start_url
@@ -462,8 +485,8 @@ class Crawler:
         queue: deque[tuple[str, int]] = deque([(start, 0)])
         in_flight: dict[Future, tuple[str, int]] = {}
 
-        while queue or in_flight:
-            # Keep every worker busy, without going over --max-pages.
+        while (queue or in_flight) and not self._stop.is_set():
+            # Keep every worker busy, without going over the page limit.
             while queue and len(in_flight) < self.workers and not self._page_limit_reached(len(in_flight)):
                 url, depth = queue.popleft()
                 if self.records[url].fetched:  # already fetched as a redirect target
@@ -477,8 +500,8 @@ class Crawler:
                 _url, depth = in_flight.pop(future)
                 self._handle_page(future.result(), depth, queue)
 
-        if queue:
-            log.info("Reached the --max-pages limit (%d); %d queued pages were not fetched.",
+        if queue and not self._stop.is_set():
+            log.info("Reached the page limit (%d); %d queued pages were not fetched.",
                      self.max_pages, len(queue))
 
     def _page_limit_reached(self, in_flight: int = 0) -> bool:
@@ -545,7 +568,7 @@ class Crawler:
         futures = {pool.submit(self._safe_fetch, r.url, False): r for r in targets}
         pending = set(futures)
         finished = 0
-        while pending:
+        while pending and not self._stop.is_set():
             done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
             for future in done:
                 finished += 1
@@ -608,7 +631,7 @@ class Crawler:
     def _fetch(self, url: str, parse_links: bool) -> FetchResult:
         result = FetchResult(url=url)
         if self._stop.is_set():
-            result.skipped, result.error = True, "cancelled"
+            result.skipped, result.error = True, CANCELLED
             return result
 
         session = self._session()

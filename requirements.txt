@@ -1,6 +1,13 @@
+# Link Crawler - Python dependencies
+#     pip install -r requirements.txt
+#
+# The desktop app (gui.py) also needs Tkinter. It ships with Python and can't be
+# installed with pip; on Ubuntu/Debian install it with:  sudo apt install python3-tk
+
 requests>=2.31,<3
 urllib3>=1.26
 beautifulsoup4>=4.12
+
 # Optional but recommended: a faster, more forgiving HTML parser.
 # The crawler falls back to Python's built-in parser if lxml is missing.
 lxml>=4.9

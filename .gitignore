@@ -14,7 +14,21 @@ env/
 .DS_Store
 Thumbs.db
 
+# Standalone app built with PyInstaller (see README)
+build/
+dist/
+*.spec
+
 # Crawl output
 crawl_results*.json
 crawl_results*.csv
 output/
+results/
+*.crawl.csv
+*.crawl.json
+
+# Excel lock files created while a CSV is open (e.g. ~$links.csv)
+~$*
+
+
+___versions/
